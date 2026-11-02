@@ -1964,7 +1964,7 @@ def build_parser():
     p = sub.add_parser("fetch", help="增量采集并下载")
     _root_arg(p)
     p.add_argument("--since", help="起始时间：7d / 12h / 2026-10-01；默认沿用上次运行时间")
-    p.add_argument("--sources", help="逗号分隔：arxiv,crossref,rss,openalex")
+    p.add_argument("--sources", help="逗号分隔：arxiv,crossref,rss,eastmoney,cninfo,openalex")
     p.add_argument("--max", type=int, help="arXiv 单次最大条数")
     p.add_argument("--pdf-limit", type=int, default=0, help="本次最多下载 PDF 篇数（0 不限）")
     p.add_argument("--no-pdf", action="store_true", help="只抓元数据，不下载 PDF")
