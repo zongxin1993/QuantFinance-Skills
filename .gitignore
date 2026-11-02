@@ -1,0 +1,20 @@
+# macOS
+.DS_Store
+._*
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# 运行时产物：资料库、日志、状态
+quant-finance-library/
+*.log
+*.sqlite
+*.db
+
+# 编辑器
+.idea/
+.vscode/
+*.swp

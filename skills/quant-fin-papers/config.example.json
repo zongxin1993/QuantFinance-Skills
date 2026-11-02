@@ -1,0 +1,183 @@
+{
+  "version": 1,
+  "email": "",
+  "keywords": [
+    "quantitative finance",
+    "asset pricing",
+    "stochastic volatility",
+    "portfolio optimization",
+    "market microstructure",
+    "risk management",
+    "machine learning in finance",
+    "high-frequency trading",
+    "option pricing",
+    "factor model"
+  ],
+  "arxiv": {
+    "enabled": true,
+    "categories": [
+      "q-fin.CP",
+      "q-fin.EC",
+      "q-fin.GN",
+      "q-fin.MF",
+      "q-fin.PM",
+      "q-fin.PR",
+      "q-fin.RM",
+      "q-fin.ST",
+      "q-fin.TR"
+    ],
+    "max_results": 60,
+    "pdf_delay": 3.0
+  },
+  "crossref": {
+    "enabled": true,
+    "keyword_search": false,
+    "per_journal": 15,
+    "lookback_days": 30,
+    "journals": [
+      {
+        "name": "Journal of Finance",
+        "issn": "0022-1082"
+      },
+      {
+        "name": "Journal of Financial Economics",
+        "issn": "0304-405X"
+      },
+      {
+        "name": "Review of Financial Studies",
+        "issn": "0893-9454"
+      },
+      {
+        "name": "Review of Finance",
+        "issn": "1572-3097"
+      },
+      {
+        "name": "Journal of Financial and Quantitative Analysis",
+        "issn": "0022-1090"
+      },
+      {
+        "name": "Mathematical Finance",
+        "issn": "0960-1627"
+      },
+      {
+        "name": "Finance and Stochastics",
+        "issn": "0949-2984"
+      },
+      {
+        "name": "SIAM Journal on Financial Mathematics",
+        "issn": "1945-497X"
+      },
+      {
+        "name": "Quantitative Finance",
+        "issn": "1469-7688"
+      },
+      {
+        "name": "Journal of Econometrics",
+        "issn": "0304-4076"
+      },
+      {
+        "name": "Journal of Banking & Finance",
+        "issn": "0378-4266"
+      },
+      {
+        "name": "Journal of Financial Markets",
+        "issn": "1386-4181"
+      },
+      {
+        "name": "Journal of Monetary Economics",
+        "issn": "0304-3932"
+      },
+      {
+        "name": "Management Science",
+        "issn": "0025-1909"
+      },
+      {
+        "name": "Operations Research",
+        "issn": "0030-364X"
+      },
+      {
+        "name": "Applied Mathematical Finance",
+        "issn": "1350-486X"
+      },
+      {
+        "name": "Journal of Computational Finance",
+        "issn": "1460-1559"
+      },
+      {
+        "name": "Financial Analysts Journal",
+        "issn": "0015-198X"
+      },
+      {
+        "name": "Journal of Portfolio Management",
+        "issn": "0095-4918"
+      },
+      {
+        "name": "Journal of Risk",
+        "issn": "1465-1211"
+      }
+    ]
+  },
+  "rss": {
+    "enabled": true,
+    "feeds": [
+      {
+        "name": "NBER",
+        "url": "https://back.nber.org/rss/new.xml",
+        "relevance": true
+      }
+    ]
+  },
+  "openalex": {
+    "enabled": false,
+    "api_key": "",
+    "max_results": 25
+  },
+  "eastmoney": {
+    "enabled": true,
+    "qtypes": [
+      0,
+      1,
+      2
+    ],
+    "page_size": 50,
+    "max_pages": 3
+  },
+  "cninfo": {
+    "enabled": true,
+    "columns": [
+      "szse"
+    ],
+    "categories": [
+      "ndbg"
+    ],
+    "page_size": 30,
+    "max_pages": 2
+  },
+  "unpaywall": {
+    "enabled": true,
+    "max_lookups": 40
+  },
+  "digest": {
+    "top_per_source": 15
+  },
+  "download_pdf": true,
+  "initial_lookback_days": 7,
+  "overlap_days": 1,
+  "max_pdf_mb": 60,
+  "storage": {
+    "type": "local",
+    "root": "",
+    "ip": "",
+    "share": "",
+    "mount_point": "",
+    "username": "",
+    "domain": "",
+    "subdir": "",
+    "auto_mount": true
+  },
+  "remote": {
+    "enabled": false,
+    "target": "",
+    "delete": false
+  }
+}
