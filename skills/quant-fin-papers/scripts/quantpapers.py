@@ -316,6 +316,7 @@ class Library:
                 pdf_path    TEXT,
                 status      TEXT,
                 reason      TEXT,
+                registered_at TEXT,
                 added_at    TEXT,
                 digested_at TEXT
             )
@@ -338,6 +339,8 @@ class Library:
         cols = {row[1] for row in conn.execute("PRAGMA table_info(papers)")}
         if "reason" not in cols:
             conn.execute("ALTER TABLE papers ADD COLUMN reason TEXT")
+        if "registered_at" not in cols:
+            conn.execute("ALTER TABLE papers ADD COLUMN registered_at TEXT")
         # 一次性补齐历史行的状态语义
         conn.execute(
             "UPDATE papers SET status='metadata', reason='no_pdf_url' "
@@ -477,7 +480,7 @@ class HttpClient:
 
 def record(source, title, url="", abstract="", authors=None, published=None,
            doi="", arxiv_id="", journal="", categories=None, pdf_url="",
-           uid="", subpath=""):
+           uid="", subpath="", registered_at=""):
     return {
         "source": source,
         "title": clean_text(title),
@@ -492,6 +495,7 @@ def record(source, title, url="", abstract="", authors=None, published=None,
         "pdf_url": pdf_url or "",
         "uid": uid or "",
         "subpath": subpath or "",
+        "registered_at": registered_at or "",
     }
 
 
@@ -553,13 +557,14 @@ def strip_version(arxiv_id):
 
 # ---- arXiv ---------------------------------------------------------------
 
-def arxiv_fetch(lib, http, since, limit):
+def arxiv_fetch(lib, http, since, limit, until=None):
     cfg = lib.cfg["arxiv"]
     cats = cfg.get("categories") or DEFAULT_CONFIG["arxiv"]["categories"]
     query = " OR ".join("cat:%s" % c for c in cats)
+    hi_dt = until or now_utc()
     if since:
         lo = since.strftime("%Y%m%d%H%M")
-        hi = now_utc().strftime("%Y%m%d%H%M")
+        hi = hi_dt.strftime("%Y%m%d%H%M")
         query = "(%s) AND submittedDate:[%s TO %s]" % (query, lo, hi)
     params = urllib.parse.urlencode({
         "search_query": query,
@@ -600,7 +605,7 @@ def arxiv_fetch(lib, http, since, limit):
 
 # ---- Crossref ------------------------------------------------------------
 
-def crossref_fetch(lib, http, since, limit):
+def crossref_fetch(lib, http, since, limit, until=None):
     """按 ISSN 监控核心期刊的新入库记录（Crossref from-created-date）。
 
     直接关键词检索的排序质量很差（会命中大量跨学科期刊），因此默认只监控
@@ -610,8 +615,12 @@ def crossref_fetch(lib, http, since, limit):
     journals = cfg.get("journals") or DEFAULT_CONFIG["crossref"]["journals"]
     per_journal = int(cfg.get("per_journal", 15))
     lookback = int(cfg.get("lookback_days", 30))
-    floor = now_utc() - timedelta(days=lookback)
-    lo = max(since, floor) if since else floor
+    if until is not None:
+        # 历史回采：尊敬传入的窗口，不要被"最近 N 天"夹住
+        lo = since or (until - timedelta(days=lookback))
+    else:
+        floor = now_utc() - timedelta(days=lookback)
+        lo = max(since, floor) if since else floor
 
     out, seen = [], set()
     skipped = {"date": 0, "irrelevant": 0, "error": 0}
@@ -620,8 +629,8 @@ def crossref_fetch(lib, http, since, limit):
         if not issn:
             continue
         params = urllib.parse.urlencode({
-            "filter": "issn:%s,from-created-date:%s,type:journal-article"
-                      % (issn, lo.strftime("%Y-%m-%d")),
+            "filter": "issn:%s,from-created-date:%s,until-created-date:%s,type:journal-article"
+                      % (issn, lo.strftime("%Y-%m-%d"), (until or now_utc()).strftime("%Y-%m-%d")),
             "rows": per_journal,
             "sort": "created",
             "order": "desc",
@@ -670,6 +679,8 @@ def crossref_fetch(lib, http, since, limit):
                 if "pdf" in (link.get("content-type") or ""):
                     pdf_url = link.get("URL") or ""
                     break
+            created_dt = parse_dt((item.get("created") or {}).get("date-time")
+                                  or (item.get("created") or {}).get("date-parts"))
             rec = record(
                 "crossref", title,
                 url="https://doi.org/%s" % doi,
@@ -679,6 +690,7 @@ def crossref_fetch(lib, http, since, limit):
                 doi=doi,
                 journal=(containers[0] if containers else (journal.get("name") or "")),
                 pdf_url=pdf_url,
+                registered_at=iso(created_dt) if created_dt else "",
             )
             rec["journal_short"] = journal.get("name") or ""
             out.append(rec)
@@ -847,14 +859,14 @@ EM_PDF = "https://pdf.dfcfw.com/pdf/H3_%s_1.pdf"
 EM_QTYPE = {0: "个股研报", 1: "行业研报", 2: "策略研报", 3: "宏观研报"}
 
 
-def eastmoney_fetch(lib, http, since, limit):
+def eastmoney_fetch(lib, http, since, limit, until=None):
     """券商研报：JSON 列表接口 + pdf.dfcfw.com 直链，无需登录。"""
     cfg = lib.cfg.get("eastmoney") or {}
     qtypes = cfg.get("qtypes") or [0, 1, 2]
     page_size = int(cfg.get("page_size", 50))
     max_pages = int(cfg.get("max_pages", 3))
     lo = since or (now_utc() - timedelta(days=7))
-    hi = now_utc()
+    hi = until or now_utc()
     out, seen = [], set()
     for qtype in qtypes:
         for page in range(1, max_pages + 1):
@@ -921,7 +933,7 @@ CN_CATEGORY = {
 }
 
 
-def cninfo_fetch(lib, http, since, limit):
+def cninfo_fetch(lib, http, since, limit, until=None):
     """上市公司公告：POST 查询接口 + static.cninfo.com.cn 直链。"""
     cfg = lib.cfg.get("cninfo") or {}
     columns = cfg.get("columns") or ["szse", "sse"]
@@ -929,7 +941,7 @@ def cninfo_fetch(lib, http, since, limit):
     page_size = int(cfg.get("page_size", 30))
     max_pages = int(cfg.get("max_pages", 2))
     lo = since or (now_utc() - timedelta(days=7))
-    hi = now_utc()
+    hi = until or now_utc()
     se_date = "%s~%s" % (lo.strftime("%Y-%m-%d"), hi.strftime("%Y-%m-%d"))
     headers = {"Referer": "http://www.cninfo.com.cn/new/commonUrl?url=disclosure/list/notice"}
     out, seen = [], set()
@@ -1040,13 +1052,14 @@ def upsert(conn, rec):
         conn.execute(
             """INSERT INTO papers (id, doi, arxiv_id, title, title_key, authors, abstract,
                    journal, published, updated, source, categories, url, pdf_url, pdf_path,
-                   status, reason, added_at)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                   status, reason, registered_at, added_at)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (pid, rec.get("doi", ""), rec.get("arxiv_id", ""), rec["title"], title_key,
              "; ".join(rec.get("authors") or []), rec.get("abstract", ""),
              rec.get("journal", ""), rec.get("published", ""), rec.get("updated", ""),
              rec.get("source", ""), ",".join(rec.get("categories") or []),
-             rec.get("url", ""), rec.get("pdf_url", ""), "", status, reason, now))
+             rec.get("url", ""), rec.get("pdf_url", ""), "", status, reason,
+             rec.get("registered_at", ""), now))
         return pid, True
 
     # 已存在：补全空缺字段，保留已有 pdf
@@ -1057,6 +1070,10 @@ def upsert(conn, rec):
     }
     conn.execute("UPDATE papers SET abstract=?, doi=?, arxiv_id=? WHERE id=?",
                  (updates["abstract"], updates["doi"], updates["arxiv_id"], pid))
+    if rec.get("registered_at"):
+        conn.execute("UPDATE papers SET registered_at=? WHERE id=? AND "
+                     "(registered_at IS NULL OR registered_at='')",
+                     (rec["registered_at"], pid))
     # 之前只有元数据的，补到 pdf_url 后重新进入待下载队列
     if has_pdf_url:
         conn.execute(
@@ -1763,6 +1780,116 @@ def render_digest(lib, ordered, since, total, top_n, full_name=""):
     return lines
 
 
+
+def chunk_iter(start, end, size="month"):
+    """按自然月/季/年切片。"""
+    cur = start.replace(hour=0, minute=0, second=0, microsecond=0)
+    if size == "quarter":
+        cur = cur.replace(month=((cur.month - 1) // 3) * 3 + 1, day=1)
+    elif size == "year":
+        cur = cur.replace(month=1, day=1)
+    else:
+        cur = cur.replace(day=1)
+    while cur <= end:
+        if size == "quarter":
+            m = cur.month + 3
+            nxt = cur.replace(year=cur.year + (m - 1) // 12,
+                              month=(m - 1) % 12 + 1, day=1)
+        elif size == "year":
+            nxt = cur.replace(year=cur.year + 1, month=1, day=1)
+        else:
+            nxt = (cur + timedelta(days=32)).replace(day=1)
+        yield cur, min(nxt - timedelta(seconds=1), end)
+        cur = nxt
+
+
+def cmd_harvest(args):
+    """历史回采：按自然月分片，逐片抓取，可断点续跑。"""
+    lib = Library(resolve_root(args))
+    lib.load()
+    lib.ensure_layout()
+    ensure_storage(lib)
+    conn = lib.connect()
+
+    start = parse_since(args.start) if args.start else datetime(2010, 1, 1, tzinfo=timezone.utc)
+    end = parse_since(args.end) if args.end else now_utc()
+    if start is None or end is None:
+        print("时间格式不对：--start/--end 用 2010-01-01 这种")
+        return 2
+
+    names = [x.strip() for x in (args.sources or "").split(",") if x.strip()]
+    if not names:
+        names = ["arxiv", "crossref", "eastmoney", "cninfo"]
+
+    policy = args.pdf or "none"          # none | all | <源名>
+    state = lib.read_state("harvest.json", {"done": {}})
+    done = state.setdefault("done", {})
+    http = HttpClient(email=lib.cfg.get("email") or "")
+
+    totals = {"new": 0, "pdf": 0, "chunks": 0, "skipped": 0}
+    for name in names:
+        adapter = ADAPTERS.get(name)
+        if adapter is None:
+            log("跳过未知源 %s" % name)
+            continue
+        saved_cfg = dict(lib.cfg.get(name) or {})
+        # 历史回采要深翻页
+        lib.cfg.setdefault(name, {})
+        lib.cfg[name]["max_pages"] = int(args.max_pages)
+        if name == "eastmoney":
+            lib.cfg[name]["page_size"] = 100
+        if name == "crossref" and args.per_journal:
+            lib.cfg[name]["per_journal"] = int(args.per_journal)
+
+        try:
+            for lo, hi in chunk_iter(start, end, args.chunk):
+                key = "%s:%s" % (name, lo.strftime("%Y%m%d"))
+                if key in done and not args.force:
+                    totals["skipped"] += 1
+                    continue
+                limit = 2000 if name == "arxiv" else 0
+                try:
+                    recs = adapter(lib, http, lo, limit, until=hi)
+                except Exception as exc:
+                    log("%s %s 失败: %s" % (name, lo.strftime("%Y-%m"), exc))
+                    continue
+                fresh = pdfs = 0
+                for rec in recs:
+                    pid, is_new = upsert(conn, rec)
+                    if is_new:
+                        fresh += 1
+                        write_sidecar(lib, pid, rec)
+                    want_pdf = policy == "all" or policy == name
+                    if want_pdf and rec.get("pdf_url"):
+                        rel, outcome, why = download_pdf(
+                            lib, http, conn, pid, rec,
+                            float((lib.cfg.get(name) or {}).get("pdf_delay", 1.0)),
+                            int(lib.cfg.get("max_pdf_mb", 60)))
+                        if outcome == "pdf":
+                            if why != "cached":
+                                pdfs += 1
+                            conn.execute("UPDATE papers SET status='pdf', reason=? WHERE id=?",
+                                         (why, pid))
+                        else:
+                            conn.execute("UPDATE papers SET status=?, reason=? WHERE id=?",
+                                         (outcome, why, pid))
+                conn.commit()
+                done[key] = {"found": len(recs), "new": fresh, "pdf": pdfs}
+                totals["new"] += fresh
+                totals["pdf"] += pdfs
+                totals["chunks"] += 1
+                lib.write_state("harvest.json", state)
+                print("  %-9s %s  %4d 条  新增 %3d  PDF %3d" % (name, lo.strftime("%Y-%m"), len(recs), fresh, pdfs))
+        finally:
+            lib.cfg[name] = saved_cfg
+        conn.commit()
+
+    conn.close()
+    print("回采完成：处理 %d 个分片，跳过 %d，新增 %d 条，下载 %d 篇"
+          % (totals["chunks"], totals["skipped"], totals["new"], totals["pdf"]))
+    return 0
+
+
 def cmd_digest(args):
     lib = Library(resolve_root(args))
     lib.load()
@@ -1980,6 +2107,19 @@ def build_parser():
     p.add_argument("--no-pdf", action="store_true", help="只收元数据")
     p.add_argument("--json", action="store_true", help="输出 JSON")
     p.set_defaults(func=cmd_sample)
+
+    p = sub.add_parser("harvest", help="历史回采：按自然月分片，可断点续跑")
+    _root_arg(p)
+    p.add_argument("--start", default="2010-01-01", help="起始日期，默认 2010-01-01")
+    p.add_argument("--end", help="结束日期，默认现在")
+    p.add_argument("--sources", help="逗号分隔，默认 arxiv,crossref,eastmoney,cninfo")
+    p.add_argument("--pdf", help="PDF 策略：none（默认）/ all / 源名（如 arxiv）")
+    p.add_argument("--chunk", default="month", choices=["month", "quarter", "year"],
+                   help="分片粒度，默认 month")
+    p.add_argument("--per-journal", type=int, help="crossref 每刊每片最多取多少条")
+    p.add_argument("--max-pages", type=int, default=40, help="每个分片最多翻多少页")
+    p.add_argument("--force", action="store_true", help="忽略断点，重跑已完成的分片")
+    p.set_defaults(func=cmd_harvest)
 
     p = sub.add_parser("backfill", help="补下历史缺失的 PDF")
     _root_arg(p)
