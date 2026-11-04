@@ -53,6 +53,7 @@ python3 scripts/quantpapers.py digest --root /abs/path/quant-finance-library --p
 | `storage` | 看存储类型/挂载状态/是否可写 | — |
 | `fetch` | 增量采集 + 下载 PDF | `--since 7d\|12h\|2026-10-01`、`--sources arxiv,crossref,rss,openalex,eastmoney,cninfo`、`--max N`、`--pdf-limit N`、`--no-pdf`、`--json` |
 | `digest` | 生成摘要：默认每源 top 15，另存一份完整版 | `--top 0`（全部）、`--since`、`--print` |
+| `harvest` | 历史回采：按年/季/月分片扫区间，可断点续跑 | `--start/--end`、`--chunk year`、`--pdf none\|all\|源名`、`--max-pdf N` |
 | `backfill` | 补下历史缺失的 PDF（扫 `new`/`failed` 且有链接的行） | `--limit`、`--sources` |
 | `sample` | 每源取最新 N 条并下载，用于验收 | `--per-source`、`--sources`、`--no-pdf` |
 | `list` | 最近入库列表 | `--query 关键词`、`--limit` |
@@ -114,6 +115,47 @@ python3 scripts/quantpapers.py disconnect
 - 目录名就是采集源的名字（RSS 用 feed 名，如 `NBER`）。
 - `pdf_path` 存的是相对 `storage.root` 的路径，换挂载点不用重建索引。
 - `digest` 里的「本地 PDF」链接是 `file://` 绝对路径，点开直接到挂载点上的文件。
+
+## 历史回采（harvest）
+
+`fetch` 只管"上次之后"，往回补历史要用 `harvest`。
+
+```bash
+# 补一年（推荐姿势：一次一年，别一口气跑十六年）
+quantpapers.py harvest --start 2010-01-01 --end 2010-12-31 \
+    --sources arxiv --pdf all --max-pdf 400
+
+# 只补元数据，不下 PDF
+quantpapers.py harvest --start 2010-01-01 --end 2026-11-04 --sources crossref --pdf none --chunk year
+```
+
+关键机制：
+
+- **分片**：`--chunk month|quarter|year`，默认按月。分片是为了绕开各平台的深翻页上限。
+- **断点续跑**：进度记在 `state/harvest.json`（键形如 `arxiv:20100101`），重跑自动跳过已完成的片，`--force` 强制重跑。
+- **单轮上限**：`--max-pdf N`。预算用尽后仍继续收元数据，只是不再下 PDF——这是"不一次性跑死"的关键。
+- **PDF 策略**：`--pdf none`（默认，最快）/ `all` / 指定源名（如 `arxiv`）。
+
+各源实际能回溯到哪一年（实测，别照抄论文里的说法）：
+
+| 源 | 最早可回溯 | 备注 |
+|---|---|---|
+| arXiv | 2010-01 | 2010 年约 526 篇，2026 年约 1900 篇/年 |
+| Crossref | 2010-01 | 20 刊 × 17 年 ≈ 3.1 万条，纯元数据 |
+| 东方财富研报 | **2017-01** | 2017 之前返回 0，不是接口故障 |
+| 巨潮公告 | 2010-01 | 年报每年 3.8k–10.4k 份，单份 5–10MB |
+| NBER | 仅当期 | RSS 只给最新，无历史 |
+
+## 时间戳：published 与 registered_at
+
+做任何时序分析前先看这一节，否则会犯前视偏差。
+
+| 字段 | 含义 | 陷阱 |
+|---|---|---|
+| `published` | 期刊期号日期 | **可以是未来**（提前排期），直接排序会"看到未来" |
+| `registered_at` | Crossref 的 `created`，出版社登记时间 | 做月度/年度时序应该用这个 |
+
+实测案例：某篇 `published=2026-03-01`，`registered_at=2025-07-28`，差 7 个月。用 `published` 做时序，等于用 2026 年 3 月的信息预测 2025 年 8 月。
 
 ## 定时增补
 
