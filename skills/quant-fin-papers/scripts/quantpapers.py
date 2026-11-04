@@ -1538,7 +1538,8 @@ def cmd_fetch(args):
                         float((lib.cfg.get(name) or {}).get("pdf_delay", 1.0)),
                         int(lib.cfg.get("max_pdf_mb", 60)))
                     if outcome == "pdf":
-                        downloaded += 1
+                        if why != "cached":      # 缓存命中不算下载
+                            downloaded += 1
                         conn.execute("UPDATE papers SET status='pdf', reason=? WHERE id=?", (why, pid))
                     else:
                         conn.execute("UPDATE papers SET status=?, reason=? WHERE id=?",
