@@ -1822,6 +1822,7 @@ def cmd_harvest(args):
         names = ["arxiv", "crossref", "eastmoney", "cninfo"]
 
     policy = args.pdf or "none"          # none | all | <源名>
+    pdf_budget = int(args.max_pdf or 0)   # 0 = 不限
     state = lib.read_state("harvest.json", {"done": {}})
     done = state.setdefault("done", {})
     http = HttpClient(email=lib.cfg.get("email") or "")
@@ -1860,6 +1861,8 @@ def cmd_harvest(args):
                         fresh += 1
                         write_sidecar(lib, pid, rec)
                     want_pdf = policy == "all" or policy == name
+                    if pdf_budget and totals["pdf"] >= pdf_budget:
+                        want_pdf = False
                     if want_pdf and rec.get("pdf_url"):
                         rel, outcome, why = download_pdf(
                             lib, http, conn, pid, rec,
@@ -2117,6 +2120,7 @@ def build_parser():
     p.add_argument("--chunk", default="month", choices=["month", "quarter", "year"],
                    help="分片粒度，默认 month")
     p.add_argument("--per-journal", type=int, help="crossref 每刊每片最多取多少条")
+    p.add_argument("--max-pdf", type=int, default=0, help="本次最多下载多少篇 PDF（0=不限）")
     p.add_argument("--max-pages", type=int, default=40, help="每个分片最多翻多少页")
     p.add_argument("--force", action="store_true", help="忽略断点，重跑已完成的分片")
     p.set_defaults(func=cmd_harvest)
