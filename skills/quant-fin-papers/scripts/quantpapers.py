@@ -1855,6 +1855,7 @@ def cmd_harvest(args):
                     log("%s %s 失败: %s" % (name, lo.strftime("%Y-%m"), exc))
                     continue
                 fresh = pdfs = 0
+                truncated = False
                 for rec in recs:
                     pid, is_new = upsert(conn, rec)
                     if is_new:
@@ -1863,6 +1864,7 @@ def cmd_harvest(args):
                     want_pdf = policy == "all" or policy == name
                     if pdf_budget and totals["pdf"] >= pdf_budget:
                         want_pdf = False
+                        truncated = True
                     if want_pdf and rec.get("pdf_url"):
                         rel, outcome, why = download_pdf(
                             lib, http, conn, pid, rec,
@@ -1877,7 +1879,14 @@ def cmd_harvest(args):
                             conn.execute("UPDATE papers SET status=?, reason=? WHERE id=?",
                                          (outcome, why, pid))
                 conn.commit()
-                done[key] = {"found": len(recs), "new": fresh, "pdf": pdfs}
+                entry = {"found": len(recs), "new": fresh, "pdf": pdfs,
+                         "truncated": truncated}
+                if truncated:
+                    # 预算截断：不标记完成，下次继续补这个分片的剩余 PDF
+                    log("%s %s 达到单轮上限，剩余 PDF 留待下次"
+                        % (name, lo.strftime("%Y-%m")))
+                else:
+                    done[key] = entry
                 totals["new"] += fresh
                 totals["pdf"] += pdfs
                 totals["chunks"] += 1
