@@ -52,7 +52,7 @@ STRONG_FINANCE_RE = re.compile(
     r"econometric\w*|backtest\w*|alpha signal\w*)\b",
     re.IGNORECASE)
 
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 DEFAULT_ROOT_NAME = "quant-finance-library"
 ARXIV_API = "https://export.arxiv.org/api/query"
 ATOM = {"a": "http://www.w3.org/2005/Atom", "arxiv": "http://arxiv.org/schemas/atom"}
@@ -129,7 +129,7 @@ DEFAULT_CONFIG = {
     "digest": {"top_per_source": 15},
     "download_pdf": True,
     "initial_lookback_days": 7,
-    "overlap_days": 1,
+    "overlap_days": 3,
     "max_pdf_mb": 60,
     "storage": {
         "type": "local",          # local | smb
@@ -376,6 +376,34 @@ class Library:
             fh.write("\n")
         os.replace(tmp, path)
 
+    def append_run_ledger(self, entry):
+        """运行台账：每轮 fetch/harvest 追加一行 JSON，供日报/审计回看。"""
+        entry = dict(entry)
+        entry.setdefault("ts", iso(now_utc()))
+        os.makedirs(self.state_dir, exist_ok=True)
+        try:
+            with open(self.state_path("runs.jsonl"), "a", encoding="utf-8") as fh:
+                fh.write(json.dumps(entry, ensure_ascii=False) + "\n")
+        except OSError as exc:
+            log("写 runs.jsonl 失败（不影响主流程）: %s" % exc)
+
+    def tail_run_ledger(self, n=5):
+        path = self.state_path("runs.jsonl")
+        if not os.path.isfile(path):
+            return []
+        try:
+            with open(path, "r", encoding="utf-8") as fh:
+                lines = fh.readlines()
+        except OSError:
+            return []
+        out = []
+        for line in lines[-n:]:
+            try:
+                out.append(json.loads(line))
+            except Exception:
+                pass
+        return out
+
 
 def deep_merge(base, override):
     for key, value in (override or {}).items():
@@ -402,7 +430,7 @@ def resolve_root(args):
 class HttpClient:
     """按域名限速 + 重试的最小 HTTP 客户端。"""
 
-    def __init__(self, email="", timeout=60, retries=3):
+    def __init__(self, email="", timeout=60, retries=4):
         self.email = email or ""
         ua = "quant-fin-papers/%s (literature archiver; mailto:%s)" % (
             VERSION, self.email or "noreply@example.com")
@@ -419,6 +447,22 @@ class HttpClient:
             if wait > 0:
                 time.sleep(wait)
         self._last[host] = time.time()
+
+    def _wait_after_error(self, exc, attempt):
+        """429 用指数退避（arXiv 限流窗口常达数分钟，短退避必然撞满）；其余短等待。"""
+        if isinstance(exc, urllib.error.HTTPError) and exc.code == 429:
+            delay = None
+            try:
+                delay = float((exc.headers.get("Retry-After") or "").strip())
+            except (TypeError, ValueError):
+                delay = None
+            if delay is None or delay <= 0:
+                delay = min(30 * (2 ** attempt), 240)
+            delay = min(delay, 300)
+            log("HTTP 429 限速，%d 秒后重试（第 %d 次）" % (delay, attempt + 1))
+            time.sleep(delay)
+            return
+        time.sleep(1.5 * (attempt + 1))
 
     def post(self, url, data, min_interval=0.0, headers=None, timeout=None):
         body = urllib.parse.urlencode(data).encode("utf-8")
@@ -440,12 +484,9 @@ class HttpClient:
                 last_error = exc
                 if exc.code in (400, 401, 403, 404, 410):
                     raise
-                if exc.code == 429:
-                    time.sleep(5 * (attempt + 1))
-                    continue
             except Exception as exc:
                 last_error = exc
-            time.sleep(1.5 * (attempt + 1))
+            self._wait_after_error(last_error, attempt)
         raise last_error if last_error else RuntimeError("post failed: %s" % url)
 
     def get(self, url, min_interval=0.0, timeout=None, binary=False):
@@ -465,12 +506,9 @@ class HttpClient:
                 last_error = exc
                 if exc.code in (400, 401, 403, 404, 410):
                     raise
-                if exc.code == 429:
-                    time.sleep(5 * (attempt + 1))
-                    continue
             except Exception as exc:  # URLError, timeout, socket errors
                 last_error = exc
-            time.sleep(1.5 * (attempt + 1))
+            self._wait_after_error(last_error, attempt)
         raise last_error if last_error else RuntimeError("request failed: %s" % url)
 
 
@@ -1322,22 +1360,64 @@ def mount_storage(lib, password="", dry_run=False, quiet=False):
     return True, "已挂载 %s -> %s" % ("//%s/%s" % (host, share), mount_point)
 
 
+def unmount_force(mount_point):
+    """强制卸载（含僵死挂载），返回 True=已不在 mount 列表。"""
+    if not is_mounted(mount_point):
+        return True
+    cmds = ([["diskutil", "unmount", "force", mount_point]] if sys.platform == "darwin"
+            else [["umount", "-f", mount_point], ["umount", mount_point]])
+    for cmd in cmds:
+        try:
+            subprocess.run(cmd, capture_output=True, text=True, timeout=90)
+        except Exception:
+            pass
+        if not is_mounted(mount_point):
+            return True
+    return not is_mounted(mount_point)
+
+
+def wait_writable(path, timeout=90, interval=5):
+    """轮询等待目录可写；沙箱内无法判定时放行，避免误伤。"""
+    deadline = time.time() + timeout
+    while True:
+        state = writable_dir(path)
+        if state is not False:
+            return True
+        if time.time() >= deadline:
+            return False
+        time.sleep(interval)
+
+
 def ensure_storage(lib):
-    """采集前确保存储可用（SMB 时自动挂载）。"""
+    """采集前确保存储可用：SMB 未挂载则挂载；挂载了但不可写（NAS 休眠/重启后
+    常见的僵死挂载）则强制卸载重挂一次。"""
     st = lib.cfg.get("storage") or {}
     if (st.get("type") or "local") != "smb":
         os.makedirs(lib.storage_root(), exist_ok=True)
         return
     mount_point = (st.get("mount_point") or "").strip() or default_mount_point(st.get("share", ""))
+    root = lib.storage_root()
     if not is_mounted(mount_point):
         if not st.get("auto_mount", True):
             raise SystemExit("SMB 未挂载且 auto_mount=false：先运行 connect 或手动挂载 %s" % mount_point)
         ok, msg = mount_storage(lib, quiet=True)
         if not ok:
             raise SystemExit("SMB 存储不可用：%s\n先执行 connect，或检查网络/VPN/共享名。" % msg)
-    root = lib.storage_root()
+        if not wait_writable(root):
+            raise SystemExit("已挂载但目录不可写: %s（共享可能只读导出，或 NAS 未就绪）" % root)
+        return
     if writable_dir(root) is False:
-        raise SystemExit("存储目录不可写: %s（共享可能只读导出，或账号无写权限）" % root)
+        # 僵死挂载：mount 列表里还在，但读写已经失效，强制重挂一次
+        log("挂载点 %s 显示已挂载但不可写，尝试强制重挂…" % mount_point)
+        if not unmount_force(mount_point):
+            raise SystemExit("无法卸载僵死的挂载点 %s，请手动执行: diskutil unmount force %s"
+                             % (mount_point, mount_point))
+        ok, msg = mount_storage(lib, quiet=True)
+        if not ok:
+            raise SystemExit("重挂失败：%s" % msg)
+        if not wait_writable(root):
+            raise SystemExit("重挂后仍不可写: %s（NAS 可能仍未就绪或共享只读导出）" % root)
+        log("重挂成功，%s 可写" % root)
 
 
 def cmd_connect(args):
@@ -1439,6 +1519,12 @@ def cmd_disconnect(args):
 def cmd_storage(args):
     lib = Library(resolve_root(args))
     lib.load()
+    if getattr(args, "ensure", False):
+        try:
+            ensure_storage(lib)
+        except SystemExit as exc:
+            print("✗ 存储自愈失败: %s" % exc)
+            return 1
     st = lib.cfg.get("storage") or {}
     mp = (st.get("mount_point") or "").strip()
     print("类型    : %s" % (st.get("type") or "local"))
@@ -1480,14 +1566,19 @@ def cmd_fetch(args):
     ensure_storage(lib)
     conn = lib.connect()
 
-    since = parse_since(args.since)
-    if since is None:
-        last = lib.read_state("last_run.json").get("last_fetch")
-        overlap = int(lib.cfg.get("overlap_days", 1))
-        if last:
-            since = parse_dt(last) - timedelta(days=overlap)
-        else:
-            since = now_utc() - timedelta(days=int(lib.cfg.get("initial_lookback_days", 7)))
+    since_cli = parse_since(args.since)
+    run_state = lib.read_state("last_run.json")
+    per_src_last = dict(run_state.get("last_by_source") or {})
+    global_last = run_state.get("last_fetch")
+    overlap = int(lib.cfg.get("overlap_days", 3))
+
+    def since_for(name):
+        if since_cli is not None:
+            return since_cli
+        base = per_src_last.get(name) or global_last
+        if base:
+            return parse_dt(base) - timedelta(days=overlap)
+        return now_utc() - timedelta(days=int(lib.cfg.get("initial_lookback_days", 7)))
 
     wanted = [s.strip() for s in (args.sources or "").split(",") if s.strip()]
     if not wanted:
@@ -1508,12 +1599,13 @@ def cmd_fetch(args):
         limit = int((lib.cfg.get(name) or {}).get("max_results", 50))
         if name == "arxiv":
             limit = int(args.max) if args.max else limit
+        since = since_for(name)
         started = iso(now_utc())
         try:
             records = adapter(lib, http, since, limit)
         except Exception as exc:
             log("%s 采集失败: %s" % (name, exc))
-            per_source[name] = {"found": 0, "new": 0, "error": str(exc)}
+            per_source[name] = {"since": iso(since), "found": 0, "new": 0, "error": str(exc)}
             totals["errors"].append("%s: %s" % (name, exc))
             conn.execute("INSERT INTO runs (started_at, ended_at, source, found, new, downloaded, error)"
                          " VALUES (?,?,?,?,?,?,?)", (started, iso(now_utc()), name, 0, 0, 0, str(exc)))
@@ -1565,7 +1657,10 @@ def cmd_fetch(args):
         conn.execute("INSERT INTO runs (started_at, ended_at, source, found, new, downloaded, error)"
                      " VALUES (?,?,?,?,?,?,?)", (started, iso(now_utc()), name, found, fresh, downloaded, ""))
         conn.commit()
-        per_source[name] = {"found": found, "new": fresh, "downloaded": downloaded}
+        per_source[name] = {"since": iso(since), "found": found, "new": fresh,
+                            "downloaded": downloaded}
+        # 只有该源完整跑完才推进它的游标；失败的源保持原位，下次重扫
+        per_src_last[name] = iso(now_utc())
         totals["found"] += found
         totals["new"] += fresh
         totals["downloaded"] += downloaded
@@ -1573,10 +1668,18 @@ def cmd_fetch(args):
 
     lib.write_state("last_run.json", {
         "last_fetch": iso(now_utc()),
-        "since": iso(since),
+        "last_by_source": per_src_last,
         "sources": per_source,
         "totals": {"found": totals["found"], "new": totals["new"],
                    "downloaded": totals["downloaded"]},
+        "errors": totals["errors"],
+    })
+    lib.append_run_ledger({
+        "cmd": "fetch",
+        "found": totals["found"], "new": totals["new"], "pdf": totals["downloaded"],
+        "sources": {k: {"found": v.get("found", 0), "new": v.get("new", 0),
+                        "pdf": v.get("downloaded", 0), "error": v.get("error")}
+                    for k, v in per_source.items()},
         "errors": totals["errors"],
     })
     conn.close()
@@ -1584,13 +1687,12 @@ def cmd_fetch(args):
     if args.json:
         print(json.dumps({
             "library": lib.root,
-            "since": iso(since),
             "sources": per_source,
             "totals": totals,
         }, ensure_ascii=False, indent=2))
     else:
-        print("抓取完成：共 %d 条，新增 %d 条，下载 PDF %d 篇（since %s）"
-              % (totals["found"], totals["new"], totals["downloaded"], iso(since)))
+        print("抓取完成：共 %d 条，新增 %d 条，下载 PDF %d 篇"
+              % (totals["found"], totals["new"], totals["downloaded"]))
         if totals["errors"]:
             print("异常源: " + "; ".join(totals["errors"]))
 
@@ -1827,6 +1929,30 @@ def cmd_harvest(args):
     done = state.setdefault("done", {})
     http = HttpClient(email=lib.cfg.get("email") or "")
 
+    next_year = None
+    if getattr(args, "next", False):
+        if len(names) != 1:
+            print("--next 一次只回采一个源，请用 --sources arxiv 指定")
+            return 2
+        name = names[0]
+        args.chunk = "month"
+        now = now_utc()
+        target = None
+        for y in range(start.year, min(end.year, now.year) + 1):
+            months = range(1, now.month + 1) if y == now.year else range(1, 13)
+            if not all(("%s:%04d%02d01" % (name, y, m)) in done for m in months):
+                target = y
+                break
+        if target is None:
+            print("%s %d-%d 月已全部回采完成，无需补采" % (name, start.year, min(end.year, now.year)))
+            conn.close()
+            return 0
+        next_year = target
+        start = datetime(target, 1, 1, tzinfo=timezone.utc)
+        end = min(end, datetime(target + 1, 1, 1, tzinfo=timezone.utc))
+        print("next: %s %d 年尚未完成，本轮从该年开始（预算 %s 篇）"
+              % (name, target, pdf_budget if pdf_budget else "不限"))
+
     totals = {"new": 0, "pdf": 0, "chunks": 0, "skipped": 0}
     for name in names:
         adapter = ADAPTERS.get(name)
@@ -1899,6 +2025,21 @@ def cmd_harvest(args):
     conn.close()
     print("回采完成：处理 %d 个分片，跳过 %d，新增 %d 条，下载 %d 篇"
           % (totals["chunks"], totals["skipped"], totals["new"], totals["pdf"]))
+    if next_year is not None and len(names) == 1:
+        months_done = sum(1 for m in range(1, 13)
+                          if ("%s:%04d%02d01" % (names[0], next_year, m)) in done)
+        print("进度：%s %d 年 %d/12 个月已完成%s"
+              % (names[0], next_year, months_done,
+                 "" if months_done < 12 else "，下一轮自动进入下一年"))
+    lib.append_run_ledger({
+        "cmd": "harvest",
+        "sources": names,
+        "year": next_year,
+        "start": iso(start), "end": iso(end),
+        "chunks": totals["chunks"], "skipped": totals["skipped"],
+        "new": totals["new"], "pdf": totals["pdf"],
+        "budget": pdf_budget or None,
+    })
     return 0
 
 
@@ -2132,6 +2273,8 @@ def build_parser():
     p.add_argument("--max-pdf", type=int, default=0, help="本次最多下载多少篇 PDF（0=不限）")
     p.add_argument("--max-pages", type=int, default=40, help="每个分片最多翻多少页")
     p.add_argument("--force", action="store_true", help="忽略断点，重跑已完成的分片")
+    p.add_argument("--next", action="store_true",
+                   help="自动选最早的未完成年份，只回采该年（配 --sources 指定单一源）")
     p.set_defaults(func=cmd_harvest)
 
     p = sub.add_parser("backfill", help="补下历史缺失的 PDF")
@@ -2185,6 +2328,8 @@ def build_parser():
 
     p = sub.add_parser("storage", help="查看存储状态（类型/挂载/是否可写）")
     _root_arg(p)
+    p.add_argument("--ensure", action="store_true",
+                   help="自动修复：未挂载则挂载，僵死挂载则强制卸载重挂")
     p.set_defaults(func=cmd_storage)
 
     p = sub.add_parser("config", help="查看/修改配置")

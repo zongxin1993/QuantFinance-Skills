@@ -50,10 +50,10 @@ python3 scripts/quantpapers.py digest --root /abs/path/quant-finance-library --p
 | `init` | 建目录、写 `config.json`、建库 | `--root` |
 | `connect` | 挂载 SMB 并把下载目录指过去 | `--ip --share --user --password --subdir --mount-point --dry-run` |
 | `disconnect` | 卸载共享 | `--mount-point` |
-| `storage` | 看存储类型/挂载状态/是否可写 | — |
+| `storage` | 看存储类型/挂载状态/是否可写 | `--ensure`（未挂载则挂载，僵死挂载强制卸载重挂） |
 | `fetch` | 增量采集 + 下载 PDF | `--since 7d\|12h\|2026-10-01`、`--sources arxiv,crossref,rss,openalex,eastmoney,cninfo`、`--max N`、`--pdf-limit N`、`--no-pdf`、`--json` |
 | `digest` | 生成摘要：默认每源 top 15，另存一份完整版 | `--top 0`（全部）、`--since`、`--print` |
-| `harvest` | 历史回采：按年/季/月分片扫区间，可断点续跑 | `--start/--end`、`--chunk year`、`--pdf none\|all\|源名`、`--max-pdf N` |
+| `harvest` | 历史回采：按年/季/月分片扫区间，可断点续跑 | `--next`（自动选最早未完成年份跑一轮，配单一 `--sources`）、`--start/--end`、`--chunk year`、`--pdf none\|all\|源名`、`--max-pdf N` |
 | `backfill` | 补下历史缺失的 PDF（扫 `new`/`failed` 且有链接的行） | `--limit`、`--sources` |
 | `sample` | 每源取最新 N 条并下载，用于验收 | `--per-source`、`--sources`、`--no-pdf` |
 | `list` | 最近入库列表 | `--query 关键词`、`--limit` |
@@ -109,10 +109,13 @@ python3 scripts/quantpapers.py disconnect
 ├── papers/<年>/<id>.json
 ├── digests/YYYY-MM-DD.md
 ├── state/{last_run,last_digest}.json
+├── state/runs.jsonl             # 运行台账：每轮 fetch/harvest 追加一行
 └── logs/
 ```
 
 - 目录名就是采集源的名字（RSS 用 feed 名，如 `NBER`）。
+- `last_run.json` 给每个源维护独立游标 `last_by_source`：**该源这轮成功才推进**；失败的源下一轮自动重扫同一窗口，再叠加 `overlap_days`（默认 3 天）冗余，限速/掉线漏掉的条目能自己补回来。
+- `runs.jsonl` 是运行台账（fetch/harvest 每轮追加一行 JSON），`tail -5 state/runs.jsonl` 直接看最近动态。
 - `pdf_path` 存的是相对 `storage.root` 的路径，换挂载点不用重建索引。
 - `digest` 里的「本地 PDF」链接是 `file://` 绝对路径，点开直接到挂载点上的文件。
 
@@ -133,6 +136,7 @@ quantpapers.py harvest --start 2010-01-01 --end 2026-11-04 --sources crossref --
 
 - **分片**：`--chunk month|quarter|year`，默认按月。分片是为了绕开各平台的深翻页上限。
 - **断点续跑**：进度记在 `state/harvest.json`（键形如 `arxiv:20100101`），重跑自动跳过已完成的片，`--force` 强制重跑。
+- **逐年补齐**：`harvest --next --sources arxiv --pdf arxiv --max-pdf 400` 自动定位最早的未完成年份、只跑该年的一轮（预算用完即停，未完成月份不标记完成），适合每天定时跑一条命令逐年推进。
 - **单轮上限**：`--max-pdf N`。预算用尽后仍继续收元数据，只是不再下 PDF——这是"不一次性跑死"的关键。
 - **PDF 策略**：`--pdf none`（默认，最快）/ `all` / 指定源名（如 `arxiv`）。
 
@@ -220,9 +224,9 @@ scripts/install_schedule.sh --print-cron   --hour 8 --minute 30 --root /abs/path
 | `SMB 存储不可用` | 先 `connect`；检查网络/VPN、共享名、用户名；`storage` 看挂载状态 |
 | `挂载失败(rc=13/EACCES)` | 账号密码不对或无权访问该共享；先 `security add-internet-password -s <ip> -a <user> -w` 存密码 |
 | `挂载失败(rc=68) server connection failed` | IP 不通或 445 端口被挡；先在 Finder「前往→连接服务器」试 `smb://ip/share` |
-| `✗ 已挂载但目录不可写` | 共享以只读方式导出（Samba `read only = yes`），或该 SMB 账号无写权限。换有写权限的账号，或让管理员改 `read only = no` / `writeable = yes` |
+| `✗ 已挂载但目录不可写` | 多半是 NAS 休眠/重启后的**僵死挂载**（mount 列表里还在，读写已失效）：跑 `storage --ensure` 自动强制卸载重挂；`fetch`/`harvest` 启动时也会自愈一次。若重挂后仍不可写，才是真只读导出（Samba `read only = yes`）或账号无写权限 |
 | `未找到资料库配置` | 先 `init`，或检查 `--root` 是否指向含 `config.json` 的目录 |
-| `HTTP Error 429` | 触发限速，等几分钟；把 `crossref.per_journal` 调小 |
+| `HTTP Error 429` | 限速会自动指数退避（默认按 `Retry-After`，否则 30/60/120 秒）；某源仍失败时它的游标不推进，第二天自动重扫补回。arXiv 通告北京时间 09:00 生效、索引常滞后 1-2 小时，定时任务放 09:30 之后更稳 |
 | 大量 403 | 出版商付费墙，会自动跳过并标 `closed`；只想留元数据就 `--set download_pdf=false` |
 | 换挂载点后 PDF 全"缺失" | 用同一个 `--subdir` 重挂；`pdf_path` 是相对路径，挂到同结构目录即可恢复 |
 
