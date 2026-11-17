@@ -1892,7 +1892,7 @@ def chunk_iter(start, end, size="month"):
         cur = cur.replace(month=1, day=1)
     else:
         cur = cur.replace(day=1)
-    while cur <= end:
+    while cur < end:   # end 恰落在分片边界（如 --next 的次年 1/1）时不生成退化分片
         if size == "quarter":
             m = cur.month + 3
             nxt = cur.replace(year=cur.year + (m - 1) // 12,
@@ -1988,7 +1988,7 @@ def cmd_harvest(args):
                         fresh += 1
                         write_sidecar(lib, pid, rec)
                     want_pdf = policy == "all" or policy == name
-                    if pdf_budget and totals["pdf"] >= pdf_budget:
+                    if pdf_budget and totals["pdf"] + pdfs >= pdf_budget:
                         want_pdf = False
                         truncated = True
                     if want_pdf and rec.get("pdf_url"):
